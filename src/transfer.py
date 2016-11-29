@@ -12,17 +12,65 @@ from . import log
 
 logger = log.get_logger(__name__)
 
-def f_walkpath(path):
-    for (root, dirs, files) in os.walk(path):
-        for name in itertools.chain(files, dirs):
-            yield os.path.join(root, name)
+class Manifest(object):
+    def __init__(self, path, callback=None, arcpath=None, relpath=None):
+        self.path = path
+        self.callback = callback
+        self.arcpath = arcpath
+        self.relpath = relpath
 
-def f_arcpath(path, arcpath=None, relpath=None):
-    if relpath:
-        path = os.path.relpath(path, relpath)
-    if arcpath:
-        path = os.path.join(arcpath, path)
-    return path
+    def walk(self):
+        for (root, dirs, files) in os.walk(self.path):
+            for name in itertools.chain(files, dirs):
+                path = os.path.join(root, name)
+
+    def get_size(self):
+        sz = 0
+        for (path, arcname) in self:
+            st = os.stat(path)
+            sz += st.st_size
+
+    def arcname(self, path):
+        if self.relpath:
+            path = os.path.relpath(path, self.relpath)
+        if self.arcpath:
+            path = os.path.join(self.arcpath, path)
+        return path
+
+    def __iter__(self):
+        for path in self.walk():
+            if self.callback and not self.callback(path):
+                continue
+            arcname = self.arcname(path)
+            yield (path, arcname)
+
+class PipeManager(object):
+    def __init__(self):
+        self.pipes = {}
+        self.pipe_count = 0
+
+    def _add_pipe(self, worker, mode, pipe):
+        if worker.name not in self.pipes:
+            self.pipes[worker.name] = {}
+        assert mode not in self.pipes[worker.name]
+        self.pipes[worker.name][mode] = pipe
+        kw = {mode: pipe}
+        worker.endpoint_bind(**kw)
+
+    def connect(self, source, target):
+        pipe = TransferPipe(self)
+        target.endpoint_bind(pipe_read=pipe)
+        self._add_pipe(source, "write", pipe)
+        self._add_pipe(target, "read", pipe)
+        self.pipe_count += 1
+
+    def close(self, name=None):
+        pipelist = [pp for (nm, pp) in self.pipes.items() if nm != name]
+        for pp in pipelist:
+            if "read" in pp:
+                pp.close_read()
+            if "write" in pp:
+                pp.close_write()
 
 class TransferManager(list):
     def plumb_workers(self):
@@ -58,14 +106,12 @@ class TransferPipe(object):
     def close(self, name=None):
         self.pipe_manager.close(name)
 
-    def close_write(self, name=''):
+    def close_write(self):
         if not self.pipe_write.closed: 
-            #print "%s: closing write pipe %d" % (name, self.pipe_write.fileno())
             self.pipe_write.close()
 
-    def close_read(self, name=''):
+    def close_read(self):
         if not self.pipe_read.closed:
-            #print "%s: closing read pipe %d" % (name, self.pipe_read.fileno())
             self.pipe_read.close()
 
     def write(self, data):
@@ -76,39 +122,39 @@ class TransferPipe(object):
             return self.pipe_read.read(bufsize)
         return self.pipe_read.read()
 
-class PipeManager(object):
+
+class Throughput(object):
     def __init__(self):
-        self.read_pipes = {}
-        self.write_pipes = {}
+        self.counter = 0
+        self.start_time = None
 
-    def connect(self, source, target):
-        pipe = TransferPipe(self)
-        source.endpoint_bind(pipe_write=pipe)
-        assert source.name not in self.write_pipes
-        self.write_pipes[source.name] = pipe
-        target.endpoint_bind(pipe_read=pipe)
-        assert target.name not in self.read_pipes
-        self.read_pipes[target.name] = pipe
+    def update(self, size):
+        now = time.time()
+        if self.start_time == None:
+            self.start_time = now
+        self.counter += size
 
-    def close(self, name=None):
-        assert name != None
-        rplist = [rp for (nm, rp) in self.read_pipes.items() if nm != name]
-        for rp in rplist:
-            rp.close_read(name)
-        wplist = [rp for (nm, rp) in self.write_pipes.items() if nm != name]
-        for wp in wplist:
-            wp.close_write(name)
+    @property
+    def throughput(self):
+        if self.start_time == None:
+            return 0
+        delta = now - self.start_time
+        if delta <= 0:
+            return 0
+        return self.counter / float(delta)
 
 class Endpoint(object):
     def __init__(self, *args, **kw):
         self.pipe_read = None
         self.pipe_write = None
+        self.pipe_read_throughput = Throughput()
+        self.pipe_write_throughput = Throughput()
 
-    def endpoint_bind(self, pipe_read=None, pipe_write=None):
+    def endpoint_bind(self, read=None, write=None):
         if pipe_read != None:
-            self.pipe_read = pipe_read
+            self.pipe_read = read
         if pipe_write != None:
-            self.pipe_write = pipe_write
+            self.pipe_write = write
 
     def endpoint_init(self):
         if self.pipe_write:
@@ -124,10 +170,13 @@ class Endpoint(object):
 
     def write(self, data):
         self.pipe_write.write(data)
+        self.pipe_write_throughput.update(len(data))
 
     def read(self, bufsize=None):
         bufsize = bufsize if bufsize != None else self.bufsize
-        return self.pipe_read.read(bufsize)
+        data = self.pipe_read.read(bufsize)
+        self.pipe_read_throughput.update(len(data))
+        return data
 
 class TransferWorker(Endpoint, multiprocessing.Process):
     Defaults = {
@@ -184,14 +233,11 @@ class UriSource(TransferWorker):
 class TarArchive(TransferWorker):
     Defaults = {
         "manifest": None,
-        "arcpath": None,
-        "relapth": None,
     }
 
     def transfer(self):
         tf = tarfile.TarFile(mode='w', fileobj=self.endpoint)
-        for path in self.manifest:
-            arcname = f_arcpath(arcpath=self.arcpath, relpath=self.relpath)
+        for (path, arcname) in self.manifest:
             tarfile.add(path, arcname=arcname)
 
 class TarExtract(TransferWorker):
