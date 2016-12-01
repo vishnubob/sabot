@@ -39,11 +39,35 @@ class SabotBucket(SabotHook):
             raise
         return True
 
+    def is_empty(self):
+        pass
+
     def upload(self, key, *args, **kw):
         return self.meta.resource.Object(self.name, key).upload(*args, **kw)
 
     def download(self, key, *args, **kw):
         return self.meta.resource.Object(self.name, key).download(*args, **kw)
+
+    def delete(self, recursive=False):
+        if recursive:
+            for obj in self:
+                obj.delete()
+        cli = self.default_session.client("s3")
+        cli.delete_bucket(Bucket=bucketname)
+
+    def list_objects(self):
+        more = True
+        token = None
+        while more:
+            kw = {"Bucket": self.name, "ContinuationToken": token}
+            resp = self.meta.client.list_objects_v2(**kw)
+            inventory = resp["Contents"]
+            token = resp["NextContinuationToken"]
+            more = resp["IsTruncated"]
+            for item in inventory:
+                key = item["Key"]
+                yield self.meta.resource.Object(Bucket=self.name, Key=key)
+    __iter__ = list_objects
 
 def get_hooks():
     this = sys.modules[__name__]
