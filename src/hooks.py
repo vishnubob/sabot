@@ -3,6 +3,8 @@ import botocore
 import inspect
 import os
 
+from . import transfer
+
 __all__ = ["get_hooks"]
 
 class SabotHook(object):
@@ -16,7 +18,10 @@ class SabotObjectS3(SabotHook):
     EventHook = "creating-resource-class.s3.Object"
 
     def upload(self, *args, **kw):
-        pass
+        return transfer.upload(*args, s3obj=self, **kw)
+
+    def download(self, *args, **kw):
+        return transfer.download(*args, s3obj=self, **kw)
 
 class SabotBucket(SabotHook):
     EventHook = "creating-resource-class.s3.Bucket"
@@ -34,15 +39,11 @@ class SabotBucket(SabotHook):
             raise
         return True
 
-    def upload(self, content, mode=None, meta=None, extra=None, block=True):
-        assert block, "non-blocking is not implemented yet"
-        # what is content?
-        if issubclass(content, basestring):
-            # is it a path?
-            if os.path.exists(content):
-                # is it a directory?
-                pass
+    def upload(self, key, *args, **kw):
+        return self.meta.resource.Object(self.name, key).upload(*args, **kw)
 
+    def download(self, key, *args, **kw):
+        return self.meta.resource.Object(self.name, key).download(*args, **kw)
 
 def get_hooks():
     this = sys.modules[__name__]

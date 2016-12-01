@@ -7,6 +7,7 @@ import uuid
 import zlib
 import bz2
 import sys
+import itertools
 
 from . import log
 
@@ -20,9 +21,13 @@ class Manifest(object):
         self.relpath = relpath
 
     def walk(self):
-        for (root, dirs, files) in os.walk(self.path):
-            for name in itertools.chain(files, dirs):
-                path = os.path.join(root, name)
+        if os.path.isdir(self.path):
+            for (root, dirs, files) in os.walk(self.path):
+                for name in itertools.chain(files, dirs):
+                    path = os.path.join(root, name)
+                    yield path
+        else:
+            yield self.path
 
     def get_size(self):
         sz = 0
@@ -59,7 +64,6 @@ class PipeManager(object):
 
     def connect(self, source, target):
         pipe = TransferPipe(self)
-        target.endpoint_bind(pipe_read=pipe)
         self._add_pipe(source, "write", pipe)
         self._add_pipe(target, "read", pipe)
         self.pipe_count += 1
@@ -68,11 +72,14 @@ class PipeManager(object):
         pipelist = [pp for (nm, pp) in self.pipes.items() if nm != name]
         for pp in pipelist:
             if "read" in pp:
-                pp.close_read()
+                pp["read"].close_read()
             if "write" in pp:
-                pp.close_write()
+                pp["write"].close_write()
 
 class TransferManager(list):
+    def __init__(self, *args):
+        self[:] = args
+
     def plumb_workers(self):
         self.pipes = PipeManager()
         last_worker = self[0]
@@ -121,8 +128,7 @@ class TransferPipe(object):
         if bufsize:
             return self.pipe_read.read(bufsize)
         return self.pipe_read.read()
-
-
+    
 class Throughput(object):
     def __init__(self):
         self.counter = 0
@@ -151,9 +157,9 @@ class Endpoint(object):
         self.pipe_write_throughput = Throughput()
 
     def endpoint_bind(self, read=None, write=None):
-        if pipe_read != None:
+        if read != None:
             self.pipe_read = read
-        if pipe_write != None:
+        if write != None:
             self.pipe_write = write
 
     def endpoint_init(self):
@@ -236,19 +242,19 @@ class TarArchive(TransferWorker):
     }
 
     def transfer(self):
-        tf = tarfile.TarFile(mode='w', fileobj=self.endpoint)
+        tf = tarfile.TarFile.open(mode='w|', fileobj=self.pipe_write)
         for (path, arcname) in self.manifest:
-            tarfile.add(path, arcname=arcname)
+            tf.add(path, arcname=arcname)
 
 class TarExtract(TransferWorker):
     Defaults = {
-        "path": None,
+        "path": ".",
         "mode": 'r',
     }
 
     def transfer(self):
-        tf = tarfile.TarFile(mode='r', fileobj=self.endpoint)
-        tarfile.extractall(path=self.path)
+        tf = tarfile.TarFile.open(mode='r|', fileobj=self.pipe_read)
+        tf.extractall(path=self.path)
 
 class GzipArchive(TransferWorker):
     def transfer(self):
@@ -271,16 +277,7 @@ class GzipExtract(TransferWorker):
             self.write(output)
         self.write(engine.flush())
 
-class Bz2Extract(TransferWorker):
-    def transfer(self):
-        engine = bz2.BZ2Decompressor()
-        while 1:
-            data = self.read()
-            if not data:
-                break
-            self.write(engine.decompress(data))
-
-class Bz2Archive(TransferWorker):
+class Bzip2Archive(TransferWorker):
     def transfer(self):
         engine = bz2.BZ2Compressor()
         while 1:
@@ -290,7 +287,16 @@ class Bz2Archive(TransferWorker):
             self.write(engine.compress(data))
         self.write(engine.flush())
 
-class FileReader(TransferWorker):
+class Bzip2Extract(TransferWorker):
+    def transfer(self):
+        engine = bz2.BZ2Decompressor()
+        while 1:
+            data = self.read()
+            if not data:
+                break
+            self.write(engine.decompress(data))
+
+class FileReaderWorker(TransferWorker):
     Defaults = {
         "path": None,
         "mode": "rb",
@@ -304,7 +310,7 @@ class FileReader(TransferWorker):
                     break
                 self.write(data)
 
-class FileWriter(TransferWorker):
+class FileWriterWorker(TransferWorker):
     Defaults = {
         "path": None,
         "mode": "wb",
@@ -319,38 +325,108 @@ class FileWriter(TransferWorker):
                 fh.write(data)
 
 class S3UploadWorker(TransferWorker):
+    Defaults = {
+        "s3obj": None,
+        "ExtraArgs": None,
+    }
+
     def transfer(self):
-        s3obj.upload_fileobj(self.endpoint, Callback=self.transfer_callback)
+        self.s3obj.upload_fileobj(self.pipe_read, ExtraArgs=self.ExtraArgs, Callback=self.transfer_callback)
 
 class S3DownloadWorker(TransferWorker):
+    Defaults = {
+        "s3obj": None,
+        "ExtraArgs": None,
+    }
+
     def transfer(self):
-        s3obj.download_fileobj(self.endpoint, Callback=self.transfer_callback)
+        self.s3obj.download_fileobj(self.pipe_write, ExtraArgs=self.ExtraArgs, Callback=self.transfer_callback)
 
-archive_map = {
-    'tar': ('tar',),
-    'tar.gz': ('tar', 'gz'),
-    'tgz': ('tar', 'gz'),
-    'tar.bz2': ('tar', 'bz2'),
-    'tbz2': ('tar', 'bz2'),
-    'gz': ('gz',),
-    'bz2': ('bz2',),
-    'zip': ('zip'),
-}
+class TransferFactory(object):
+    ArchiveChainMap = {
+        'tar': ('tar',),
+        'tar.gz': ('tar', 'gz'),
+        'tgz': ('tar', 'gz'),
+        'tar.bz2': ('tar', 'bz2'),
+        'tbz2': ('tar', 'bz2'),
+        'gz': ('gz',),
+        'bz2': ('bz2',),
+        'zip': ('zip'),
+    }
+    ArchiveMap = {
+        "tar": TarArchive,
+        "gz": GzipArchive,
+        "bz2": Bzip2Archive,
+        "zip": None,
+    }
+    ExtractMap = {
+        "tar": TarExtract,
+        "gz": GzipExtract,
+        "bz2": Bzip2Extract,
+        "zip": None,
+    }
 
-def archive_factory(mode='r', ext="tar.gz"):
-    chain = archive_map.get(ext.lower(), None)
-    if chain == None:
-        msg = "undiscernible archive format '%s'" % ext.lower()
-        raise ValueError(msg)
-    if 'tar' in chain:
-        if 'gz' in chain:
-            mode = mode + "|gz"
-        elif 'bz2' in chain:
-            mode = mode + "|bz2"
+    def extract_chain(self, archive=None, **kw):
+        if archive == None:
+            return []
+        cart = self.ArchiveChainMap.get(archive, None)
+        if cart == None:
+            msg = "undiscernible archive format '%s'" % ext
+            raise ValueError(msg)
+        chain = [self.ExtractMap[cn](**kw) for cn in cart[::-1]]
+        return chain
 
-def upload_factory(s3obj, ext="tar.gz", *args, **kw):
-    (pipe_read, pipe_write) = pipe_factory()
-    args = (s3obj, pipe_read)
-    chain = [TransferWorker(args)]
-    if 'tar' in ext:
-        tar_factory(ext=ext)
+    def archive_chain(self, archive=None, **kw):
+        if archive == None:
+            return []
+        cart = self.ArchiveChainMap.get(archive, None)
+        if cart == None:
+            msg = "undiscernible archive format '%s'" % ext
+            raise ValueError(msg)
+        chain = [self.ArchiveMap[cn](**kw) for cn in cart]
+        return chain
+
+    def upload(self, path=None, manifest=None, s3obj=None, relpath=None, arcpath=None, archive=None, **kw):
+        if path and manifest:
+            raise ValueError("You can only specify a path or a manifest")
+        if path:
+            if not os.path.exists(path):
+                raise ValueError("path does not exist: %s" % path)
+            if os.path.isdir(path):
+                if not recursive:
+                    raise ValueError("uploading directories requires recursive flag")
+                manifest = Manifest(path, relpath=relpath, arcpath=arcpath)
+            else:
+                archive = archive if archive != None else "bz2"
+                chain = self.archive_chain(archive)
+                chain = [FileReaderWorker(path=path)] + chain
+        if manifest:
+            archive = archive if archive != None else "tar.bz2"
+            chain = self.archive_chain(archive, manifest=manifest)
+        extra = {
+            "Metadata": {
+                "__manifest__": str((manifest != None)),
+                "__archive__": str(archive),
+            }
+        }
+        chain = chain + [S3UploadWorker(s3obj=s3obj, ExtraArgs=extra)]
+        tm = TransferManager(*chain)
+        tm.start()
+        return tm
+            
+    def download(self, s3obj=None, archive=None, **kw):
+        archive = archive if archive != None else s3obj.metadata.get("__archive__", None)
+        manifest_flag = s3obj.metadata.get("__manifest__", False)
+        chain = self.extract_chain(archive, **kw)
+        chain = [S3DownloadWorker(s3obj=s3obj)] + chain
+        if not manifest_flag or not archive:
+            chain = chain + [FileWriterWorker(**kw)]
+        tm = TransferManager(*chain)
+        tm.start()
+        return tm
+
+def upload(*args, **kw):
+    return TransferFactory().upload(*args, **kw)
+
+def download(*args, **kw):
+    return TransferFactory().download(*args, **kw)
